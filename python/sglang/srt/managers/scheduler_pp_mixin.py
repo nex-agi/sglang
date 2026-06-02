@@ -791,7 +791,14 @@ class SchedulerPPMixin:
         for req in self.disagg_prefill_bootstrap_queue.queue:
             if req.rid not in rid_set:
                 continue
-            req.init_next_round_input(self.tree_cache)
+            # Probe the prefix length only. cow_mamba=False is critical: the
+            # default (True for mamba models) makes match_prefix fork/copy the
+            # recurrent state into req.mamba_pool_idx, and this speculative call
+            # runs before the req is scheduled, repeatedly per bootstrap poll and
+            # independently per PP rank. That corrupts mamba-state ownership
+            # (wrong-length state, leaked slots) and shows up as decode repetition.
+            # The matched length is independent of cow_mamba.
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
             prefix_len_caps[req.rid] = len(req.prefix_indices) + req.host_hit_length
         return prefix_len_caps
 
