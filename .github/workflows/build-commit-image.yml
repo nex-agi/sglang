@@ -54,13 +54,13 @@ jobs:
           docker build \
             -f Dockerfile.pd-patch \
             -t "${IMAGE}:${DEPLOY_TAG}" \
-            -t "${IMAGE}:${{ steps.tags.outputs.sha }}" \
+            -t "${IMAGE}:${DEPLOY_TAG}-${{ steps.tags.outputs.sha }}" \
             .
 
       - name: Push image
         run: |
           docker push "${IMAGE}:${DEPLOY_TAG}"
-          docker push "${IMAGE}:${{ steps.tags.outputs.sha }}"
+          docker push "${IMAGE}:${DEPLOY_TAG}-${{ steps.tags.outputs.sha }}"
 
       - name: Logout from Harbor
         if: always()
@@ -71,8 +71,8 @@ jobs:
           {
             echo "### PD-patch image published"
             echo ""
-            echo "- \`${IMAGE}:${DEPLOY_TAG}\`"
-            echo "- \`${IMAGE}:${{ steps.tags.outputs.sha }}\`"
+            echo "- \`${IMAGE}:${DEPLOY_TAG}\` (stable deploy tag)"
+            echo "- \`${IMAGE}:${DEPLOY_TAG}-${{ steps.tags.outputs.sha }}\` (commit-pinned)"
             echo "- commit: \`${GITHUB_SHA}\`"
             echo "- branch: \`${GITHUB_REF_NAME}\`"
           } >> "$GITHUB_STEP_SUMMARY"
