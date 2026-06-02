@@ -1008,6 +1008,43 @@ class MooncakeKVManager(CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                # PP-aware Mamba state transfer: when prefill runs with pipeline
+                # parallelism, each prefill PP stage only owns a subset of the
+                # model's Mamba layers, while the decode side (PP=1) registers
+                # the full set. The decode-side dst arrays are therefore longer
+                # than the local src arrays; slice them down to the layers this
+                # PP stage actually owns so the per-layer transfer blocks stay
+                # aligned. Without this, len(dst) > len(src) and indexing the
+                # src arrays raises IndexError.
+                total_mamba_layer_ids = (
+                    getattr(self.kv_args, "total_mamba_layer_ids", []) or []
+                )
+                mamba_layer_pos = getattr(self.kv_args, "mamba_layer_ids", []) or []
+                total_layers = len(total_mamba_layer_ids)
+                if (
+                    total_layers > 0
+                    and 0 < len(mamba_layer_pos) < total_layers
+                    and len(dst_data_ptrs) > len(src_data_ptrs)
+                    and len(dst_data_ptrs) % total_layers == 0
+                ):
+                    num_tensors = len(dst_data_ptrs) // total_layers
+                    # dst layout is grouped by tensor then by layer:
+                    # [tensor0_layer0..tensor0_layer(T-1), tensor1_layer0, ...].
+                    # Pick this stage's owned layer positions within each tensor.
+                    sel = [
+                        base + pos
+                        for base in range(0, total_layers * num_tensors, total_layers)
+                        for pos in mamba_layer_pos
+                    ]
+                    dst_data_ptrs = [dst_data_ptrs[k] for k in sel]
+                    dst_item_lens = (
+                        [dst_item_lens[k] for k in sel] if dst_item_lens else dst_item_lens
+                    )
+                    dst_dim_per_tensor = (
+                        [dst_dim_per_tensor[k] for k in sel]
+                        if dst_dim_per_tensor
+                        else dst_dim_per_tensor
+                    )
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size

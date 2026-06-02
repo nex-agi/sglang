@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING
 
@@ -610,7 +611,35 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
+                    # PP-aware Mamba state transfer in disaggregation: record the
+                    # full ordered Mamba layer list and the positions this PP
+                    # stage owns, so the prefill sender can slice the decode-side
+                    # (PP=1) full state pointers down to this stage's subset.
+                    total_mamba_layer_ids=list(config.mamba2_cache_params.layers),
+                    mamba_layer_ids=(
+                        []
+                        if self.is_draft_worker
+                        else [
+                            pos
+                            for pos, layer_id in enumerate(
+                                config.mamba2_cache_params.layers
+                            )
+                            if self.start_layer <= layer_id < self.end_layer
+                        ]
+                    ),
                     **extra_args,
+                )
+                # PP-aware full-attention KV transfer in disaggregation: the
+                # decode side (PP=1) registers KV pointers indexed by
+                # full-attention-layer position, but this PP stage's start_layer
+                # is an absolute model layer id. For hybrid models full-attention
+                # layers are sparse, so absolute id != position. Record the
+                # number of full-attention layers before this stage so the
+                # prefill sender slices the decode-side pointer list correctly.
+                self.token_to_kv_pool.full_attention_start_offset = (
+                    bisect.bisect_left(
+                        list(config.full_attention_layer_ids), self.start_layer
+                    )
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):

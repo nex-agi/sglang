@@ -570,6 +570,10 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    # PP-aware Mamba state transfer: full Mamba layer list + positions owned by
+    # this (PP) stage. Populated from whichever pool provides the Mamba state.
+    kv_args.total_mamba_layer_ids = []
+    kv_args.mamba_layer_ids = []
 
     if hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
@@ -588,6 +592,12 @@ def setup_state_kv_args(
             )
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+            )
+            kv_args.total_mamba_layer_ids = list(
+                getattr(token_to_kv_pool, "total_mamba_layer_ids", []) or []
+            )
+            kv_args.mamba_layer_ids = list(
+                getattr(token_to_kv_pool, "mamba_layer_ids", []) or []
             )
         elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
@@ -625,6 +635,12 @@ def setup_state_kv_args(
             )
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+            )
+            kv_args.total_mamba_layer_ids = list(
+                getattr(req_to_token_pool, "total_mamba_layer_ids", []) or []
+            )
+            kv_args.mamba_layer_ids = list(
+                getattr(req_to_token_pool, "mamba_layer_ids", []) or []
             )
 
 
