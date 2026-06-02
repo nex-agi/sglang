@@ -157,7 +157,15 @@ class PrefillBootstrapQueue:
             "full_attention_start_offset",
             self.token_to_kv_pool.start_layer,
         )
-        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
+        # Mirror prefill_start_layer: for hybrid pools use the full-attention
+        # end offset (same coordinate space as the offset start), falling back
+        # to the absolute end_layer for non-hybrid pools (e.g. DeepSeek V4,
+        # whose compressed-MLA slicing expects an absolute layer id).
+        kv_args.prefill_end_layer = getattr(
+            self.token_to_kv_pool,
+            "full_attention_end_offset",
+            getattr(self.token_to_kv_pool, "end_layer", None),
+        )
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()

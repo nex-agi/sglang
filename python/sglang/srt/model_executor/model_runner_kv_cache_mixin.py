@@ -636,10 +636,17 @@ class ModelRunnerKVCacheMixin:
                 # layers are sparse, so absolute id != position. Record the
                 # number of full-attention layers before this stage so the
                 # prefill sender slices the decode-side pointer list correctly.
-                self.token_to_kv_pool.full_attention_start_offset = (
-                    bisect.bisect_left(
-                        list(config.full_attention_layer_ids), self.start_layer
-                    )
+                _full_attn_layer_ids = list(
+                    getattr(config, "full_attention_layer_ids", []) or []
+                )
+                self.token_to_kv_pool.full_attention_start_offset = bisect.bisect_left(
+                    _full_attn_layer_ids, self.start_layer
+                )
+                # Keep start and end in the same coordinate space (full-attention
+                # layer positions) so any consumer slicing [start:end] on the
+                # decode-side KV pointers stays consistent.
+                self.token_to_kv_pool.full_attention_end_offset = bisect.bisect_left(
+                    _full_attn_layer_ids, self.end_layer
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
