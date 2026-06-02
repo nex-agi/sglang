@@ -37,12 +37,17 @@ jobs:
           echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "Building ${IMAGE}:${DEPLOY_TAG} and ${IMAGE}:${SHORT_SHA}"
 
-      - name: Log in to internal Harbor
+      - name: Log in to internal Harbor (or rely on runner ambient auth)
         run: |
-          echo "${{ secrets.HARBOR_PASSWORD }}" \
-            | docker login harbor.local.clusters \
-                -u "${{ secrets.HARBOR_USERNAME }}" \
-                --password-stdin
+          if [ -n "${{ secrets.HARBOR_USERNAME }}" ]; then
+            echo "${{ secrets.HARBOR_PASSWORD }}" \
+              | docker login harbor.local.clusters \
+                  -u "${{ secrets.HARBOR_USERNAME }}" \
+                  --password-stdin
+          else
+            echo "No HARBOR_USERNAME secret on this repo; relying on the "\
+                 "docker-builder runner's pre-configured Harbor credentials."
+          fi
 
       - name: Build image
         run: |
