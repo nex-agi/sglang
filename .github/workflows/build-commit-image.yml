@@ -8,10 +8,6 @@ on:
   push:
     branches:
       - feat/qwen3_5-pd-pp-fix
-    paths:
-      - "python/sglang/**"
-      - "Dockerfile.pd-patch"
-      - ".github/workflows/build-commit-image.yml"
   workflow_dispatch:
     inputs:
       deploy_tag:
