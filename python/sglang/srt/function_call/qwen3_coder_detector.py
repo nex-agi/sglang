@@ -2,7 +2,7 @@ import ast
 import json
 import logging
 import re
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -13,6 +13,10 @@ from sglang.srt.function_call.core_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Parameter types that are eligible for incremental streaming of the raw
+# value. Other types have to be fully materialized before type conversion.
+_STRING_PARAM_TYPES = {"string", "str", "text", "varchar", "char", "enum"}
 
 
 class Qwen3CoderDetector(BaseFormatDetector):
@@ -53,6 +57,25 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+
+        # Incremental streaming state for a string-typed parameter value:
+        # once we cross the opening `<parameter=name>` we emit `"key": "` and
+        # then stream raw chunks of the value as they arrive, ending with
+        # the closing `"` when a terminator is seen.
+        self._streaming_param_name: Optional[str] = None
+        self._streaming_prefix_sent: bool = False
+        self._streaming_leading_stripped: bool = False
+
+        # Tag prefixes used to guard a streamed chunk against cutting into
+        # the middle of an (unfinished) structural tag.
+        self._known_tag_prefixes: Tuple[str, ...] = (
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+            self.tool_call_prefix,
+            self.function_end_token,
+            self.parameter_prefix,
+            self.parameter_end_token,
+        )
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -237,11 +260,95 @@ class Qwen3CoderDetector(BaseFormatDetector):
             logger.error(f"Error in detect_and_parse: {e}")
             return StreamingParseResult(normal_text=text)
 
+    def _is_string_param(self, param_name: str, tools: List[Tool]) -> bool:
+        """Whether a parameter should be streamed incrementally as a string."""
+        config = self._get_arguments_config(self.current_func_name, tools)
+        if not config or param_name not in config:
+            # Unknown parameter defaults to string so text is still streamed.
+            return True
+        param_schema = config.get(param_name, {})
+        if isinstance(param_schema, dict) and "type" in param_schema:
+            param_type = str(param_schema["type"]).strip().lower()
+        else:
+            param_type = "string"
+        return param_type in _STRING_PARAM_TYPES
+
+    def _find_earliest_param_end(
+        self, text: str
+    ) -> Optional[Tuple[int, int]]:
+        """Earliest parameter-value terminator position in text.
+
+        Returns (position, consumed_length). consumed_length is 0 for the
+        "abnormal" terminators (next <parameter= or </function>) so that the
+        caller can re-process that tag on the next iteration.
+        """
+        candidates: List[Tuple[int, int]] = []
+        end_param = text.find(self.parameter_end_token)
+        if end_param != -1:
+            candidates.append((end_param, len(self.parameter_end_token)))
+        next_param = text.find(self.parameter_prefix)
+        if next_param != -1:
+            candidates.append((next_param, 0))
+        end_func = text.find(self.function_end_token)
+        if end_func != -1:
+            candidates.append((end_func, 0))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda x: x[0])
+
+    def _safe_string_stream_len(self, text: str) -> int:
+        """Length of text safe to emit without cutting a partial tag prefix."""
+        n = len(text)
+        if n == 0:
+            return 0
+        search_from = 0
+        while search_from < n:
+            lt_pos = text.find("<", search_from)
+            if lt_pos == -1:
+                return n
+            suffix = text[lt_pos:]
+            # If the suffix starting at this '<' could still be completed
+            # into a known tag, treat it as ambiguous and back off.
+            for tag in self._known_tag_prefixes:
+                if tag.startswith(suffix):
+                    return lt_pos
+            # This '<' cannot start any known tag - it is literal content.
+            search_from = lt_pos + 1
+        return n
+
+    def _emit_string_prefix(
+        self, param_name: str, calls: List[ToolCallItem]
+    ) -> None:
+        """Emit '{' (if needed) plus the '"key": "' opener for a string value."""
+        if not self.json_started:
+            calls.append(
+                ToolCallItem(tool_index=self.current_tool_id, parameters="{")
+            )
+            self.json_started = True
+
+        if self.current_tool_param_count > 0:
+            prefix = f', {json.dumps(param_name)}: "'
+        else:
+            prefix = f'{json.dumps(param_name)}: "'
+        calls.append(
+            ToolCallItem(tool_index=self.current_tool_id, parameters=prefix)
+        )
+        self.current_tool_param_count += 1
+        self._streaming_prefix_sent = True
+
+    def _reset_string_streaming_state(self) -> None:
+        self._streaming_param_name = None
+        self._streaming_prefix_sent = False
+        self._streaming_leading_stripped = False
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Robust cursor-based streaming parser.
+        Robust cursor-based streaming parser. String-typed parameter values
+        are streamed incrementally as their raw chunks arrive; other types
+        are buffered until the parameter terminator is seen so the value can
+        be properly type-converted before emission.
         """
         self._buffer += new_text
 
@@ -258,6 +365,82 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
             # Optimization: If almost empty, wait for more
             if not current_slice:
+                break
+
+            # -------------------------------------------------------
+            # 0. Active incremental string parameter value streaming
+            # -------------------------------------------------------
+            if self._streaming_param_name is not None:
+                # Strip a single leading newline once, at the very start of
+                # the value (before any content has been emitted).
+                if not self._streaming_leading_stripped:
+                    if current_slice[0] == "\n":
+                        self.parsed_pos += 1
+                        self._streaming_leading_stripped = True
+                        continue
+                    self._streaming_leading_stripped = True
+                    # Fall through with the same slice.
+
+                end_info = self._find_earliest_param_end(current_slice)
+
+                if end_info is not None:
+                    end_pos, end_len = end_info
+                    raw_value = current_slice[:end_pos]
+                    # Mirror the non-streaming strip of a single trailing \n.
+                    if raw_value.endswith("\n"):
+                        raw_value = raw_value[:-1]
+
+                    if not self._streaming_prefix_sent:
+                        self._emit_string_prefix(
+                            self._streaming_param_name, calls
+                        )
+
+                    if raw_value:
+                        escaped = json.dumps(raw_value, ensure_ascii=False)[
+                            1:-1
+                        ]
+                        if escaped:
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    parameters=escaped,
+                                )
+                            )
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id, parameters='"'
+                        )
+                    )
+
+                    self.parsed_pos += end_pos + end_len
+                    self._reset_string_streaming_state()
+                    continue
+
+                # No terminator yet - emit what we can safely, holding back
+                # any suffix that could be part of an incoming tag.
+                safe_len = self._safe_string_stream_len(current_slice)
+                if safe_len > 0:
+                    chunk = current_slice[:safe_len]
+                    # Hold back a trailing newline: if it turns out to be
+                    # the value's trailing newline it must be stripped when
+                    # the terminator finally arrives.
+                    if chunk.endswith("\n"):
+                        chunk = chunk[:-1]
+
+                    if chunk:
+                        if not self._streaming_prefix_sent:
+                            self._emit_string_prefix(
+                                self._streaming_param_name, calls
+                            )
+                        escaped = json.dumps(chunk, ensure_ascii=False)[1:-1]
+                        if escaped:
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    parameters=escaped,
+                                )
+                            )
+                        self.parsed_pos += len(chunk)
                 break
 
             # -------------------------------------------------------
@@ -302,82 +485,74 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if current_slice.startswith(self.parameter_prefix):
                 name_end = current_slice.find(">")
                 if name_end != -1:
+                    param_name = current_slice[
+                        len(self.parameter_prefix) : name_end
+                    ]
                     value_start_idx = name_end + 1
                     rest_of_slice = current_slice[value_start_idx:]
 
-                    # A parameter can end in multiple ways:
-                    # 1. [Normal] Encounter </parameter>
-                    # 2. [Abnormal] Encounter next <parameter=
-                    # 3. [Abnormal] Encounter </function>
-                    # So we need to find the smallest one as the parameter end position.
-                    cand_end_param = rest_of_slice.find(self.parameter_end_token)
-                    cand_next_param = rest_of_slice.find(self.parameter_prefix)
-                    cand_end_func = rest_of_slice.find(self.function_end_token)
-
-                    candidates = []
-                    if cand_end_param != -1:
-                        candidates.append(
-                            (cand_end_param, len(self.parameter_end_token))
-                        )
-                    if cand_next_param != -1:
-                        candidates.append((cand_next_param, 0))
-                    if cand_end_func != -1:
-                        candidates.append((cand_end_func, 0))
-
-                    if candidates:
-                        best_cand = min(candidates, key=lambda x: x[0])
-                        end_pos = best_cand[0]
-                        end_token_len = best_cand[1]
-
-                        param_name = current_slice[
-                            len(self.parameter_prefix) : name_end
-                        ]
-                        raw_value = rest_of_slice[:end_pos]
-
-                        # Cleanup value
-                        if raw_value.startswith("\n"):
-                            raw_value = raw_value[1:]
-                        if raw_value.endswith("\n"):
-                            raw_value = raw_value[:-1]
-
-                        # JSON Construction
-                        if not self.json_started:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id, parameters="{"
-                                )
-                            )
-                            self.json_started = True
-
-                        param_config = self._get_arguments_config(
-                            self.current_func_name, tools
-                        )
-                        converted_val = self._convert_param_value(
-                            raw_value, param_name, param_config, self.current_func_name
-                        )
-
-                        # Construct JSON fragment: "key": value
-                        # Note: We must be careful with json.dumps to ensure valid JSON streaming
-                        json_key_val = f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
-
-                        if self.current_tool_param_count > 0:
-                            fragment = f", {json_key_val}"
-                        else:
-                            fragment = json_key_val
-
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id, parameters=fragment
-                            )
-                        )
-                        self.current_tool_param_count += 1
-
-                        # Advance cursor
-                        total_len = (name_end + 1) + end_pos + end_token_len
-                        self.parsed_pos += total_len
+                    if self._is_string_param(param_name, tools):
+                        # Enter incremental string streaming mode. The value
+                        # will be emitted chunk-by-chunk in branch 0 above.
+                        self.parsed_pos += value_start_idx
+                        self._streaming_param_name = param_name
+                        self._streaming_prefix_sent = False
+                        self._streaming_leading_stripped = False
                         continue
 
-                # Incomplete parameter tag or value
+                    # Non-string: buffer the full value so it can be type
+                    # converted before emission.
+                    end_info = self._find_earliest_param_end(rest_of_slice)
+                    if end_info is None:
+                        break
+
+                    end_pos, end_len = end_info
+                    raw_value = rest_of_slice[:end_pos]
+
+                    # Cleanup value
+                    if raw_value.startswith("\n"):
+                        raw_value = raw_value[1:]
+                    if raw_value.endswith("\n"):
+                        raw_value = raw_value[:-1]
+
+                    # JSON Construction
+                    if not self.json_started:
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id, parameters="{"
+                            )
+                        )
+                        self.json_started = True
+
+                    param_config = self._get_arguments_config(
+                        self.current_func_name, tools
+                    )
+                    converted_val = self._convert_param_value(
+                        raw_value, param_name, param_config, self.current_func_name
+                    )
+
+                    # Construct JSON fragment: "key": value
+                    # Note: We must be careful with json.dumps to ensure valid JSON streaming
+                    json_key_val = f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
+
+                    if self.current_tool_param_count > 0:
+                        fragment = f", {json_key_val}"
+                    else:
+                        fragment = json_key_val
+
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id, parameters=fragment
+                        )
+                    )
+                    self.current_tool_param_count += 1
+
+                    # Advance cursor
+                    total_len = (name_end + 1) + end_pos + end_len
+                    self.parsed_pos += total_len
+                    continue
+
+                # Incomplete parameter tag
                 break
 
             # -------------------------------------------------------
@@ -425,17 +600,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
             elif next_open_angle == 0:
                 # Looks like a Tag, but doesn't match any known Tag above
 
-                possible_tags = [
-                    self.tool_call_start_token,
-                    self.tool_call_end_token,
-                    self.tool_call_prefix,
-                    self.function_end_token,
-                    self.parameter_prefix,
-                    self.parameter_end_token,
-                ]
-
                 is_potential_tag = False
-                for tag in possible_tags:
+                for tag in self._known_tag_prefixes:
                     if tag.startswith(current_slice):
                         is_potential_tag = True
                         break
