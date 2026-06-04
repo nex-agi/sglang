@@ -146,8 +146,26 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
+        kv_args.prefill_pp_size = self.pp_size
+        # For hybrid-linear models the KV (full-attention) pointer list on the
+        # decode side is indexed by full-attention-layer position, not absolute
+        # layer id. Use the precomputed full-attention offset for this PP stage
+        # so get_mha_kv_ptrs_with_pp slices the decode pointers correctly;
+        # non-hybrid pools fall back to the absolute start_layer (== position).
+        kv_args.prefill_start_layer = getattr(
+            self.token_to_kv_pool,
+            "full_attention_start_offset",
+            self.token_to_kv_pool.start_layer,
+        )
+        # Mirror prefill_start_layer: for hybrid pools use the full-attention
+        # end offset (same coordinate space as the offset start), falling back
+        # to the absolute end_layer for non-hybrid pools (e.g. DeepSeek V4,
+        # whose compressed-MLA slicing expects an absolute layer id).
+        kv_args.prefill_end_layer = getattr(
+            self.token_to_kv_pool,
+            "full_attention_end_offset",
+            getattr(self.token_to_kv_pool, "end_layer", None),
+        )
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()

@@ -41,6 +41,13 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # For PP prefill with Mamba/hybrid-linear models. ``total_mamba_layer_ids``
+    # is the full ordered list of the model's Mamba layer ids; ``mamba_layer_ids``
+    # holds the positions within that list owned by this prefill PP stage. Used
+    # to slice the decode-side (PP=1) state pointers down to the local subset
+    # during transfer. Empty when not applicable (no PP / non-mamba models).
+    total_mamba_layer_ids: List[int]
+    mamba_layer_ids: List[int]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -51,6 +58,11 @@ class KVArgs:
     system_dp_rank: int
     # for pp prefill
     pp_rank: int
+    # Prefill-side pipeline-parallel size. Used by get_mha_kv_ptrs_with_pp to
+    # distinguish a PP layer-split (prefill_pp_size > 1) from a decode-side
+    # draft-model KV layout, which would otherwise alias on the same layer-count
+    # heuristic. Defaults to 1 when unset.
+    prefill_pp_size: int
     prefill_start_layer: int
     # Absolute end layer (exclusive) for this prefill PP stage. Needed to
     # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat

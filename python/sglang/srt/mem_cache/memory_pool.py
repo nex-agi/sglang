@@ -1406,6 +1406,8 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        total_mamba_layer_ids: Optional[List[int]] = None,
+        mamba_layer_ids: Optional[List[int]] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1413,6 +1415,11 @@ class HybridLinearKVPool(KVCache):
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
         self.start_layer = start_layer if start_layer is not None else 0
+        # Full ordered list of the model's Mamba layer ids and the positions
+        # within it owned by this (PP) stage. Used for PP-aware Mamba state
+        # transfer in disaggregation. See KVArgs for details.
+        self.total_mamba_layer_ids = total_mamba_layer_ids or []
+        self.mamba_layer_ids = mamba_layer_ids or []
         self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim

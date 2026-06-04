@@ -451,11 +451,16 @@ class CommonKVManager(BaseKVManager):
             dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
             dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
         elif (
-            num_kv_layers < dst_num_total_layers
+            getattr(self.kv_args, "prefill_pp_size", 1) == 1
+            and num_kv_layers < dst_num_total_layers
             and dst_num_total_layers % num_kv_layers != 0
         ):
             # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
             # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
+            # Guarded by prefill_pp_size == 1: when prefill uses PP, a shorter
+            # src list is a layer-split (handled by the else branch below), not a
+            # draft-model layout. The guard is first so PP stages with zero
+            # full-attention layers don't hit the modulo (divide-by-zero).
             multiplier_ratio = dst_num_total_layers // num_kv_layers
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             v_ptr_offset = num_kv_layers * multiplier_ratio
